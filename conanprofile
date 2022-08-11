@@ -1,0 +1,8 @@
+include(default)
+
+[settings]
+compiler.cppstd=17
+
+[options] 
+# Override autodetection since we don't need or want to match the system's default ABI (we're building statically)
+boost:extra_b2_flags=define=_GLIBCXX_USE_CXX11_ABI=1
