@@ -166,7 +166,16 @@ static int64_t chunk_stream(int stream, int64_t chunkSize, int64_t expectedSize,
     bool overallFailure = false;
     int64_t totalCopied = 0;
     int expectedChunks = numeric_cast<int>((expectedSize + chunkSize - 1) / chunkSize);
-    
+    int lastChunkWanted;
+
+    // Do we already know the index of the final chunk we will produce due to finite onlyChunks filters?
+    if (!onlyChunks.empty() && !onlyChunks.containsPositiveInf() && onlyChunks.getLargestBound(lastChunkWanted)) {
+        // This overrides the calculation based on expectedSize
+        expectedChunks = lastChunkWanted + 1;
+    } else {
+        lastChunkWanted = -1; // Final chunk is unknown
+    }
+
     // If the user explicitly referenced chunk indexes in onlyChunks, also preallocate FIFOs reaching that number
     int maxBound;
     if (onlyChunks.getLargestBound(maxBound)) {
@@ -179,15 +188,16 @@ static int64_t chunk_stream(int stream, int64_t chunkSize, int64_t expectedSize,
             if (shouldWriteChunk(chunkIndex)) {
                 std::string fifoFilename = chunkPrefix + std::to_string(chunkIndex);
                 create_fifo(fifoFilename);
-                
+
                 std::cerr << "Preallocated FIFO for chunk " << chunkIndex << " at \"" << fifoFilename << "\"" << std::endl;
             }
         }
     }
 
+    // Get EPIPE errors from write() calls instead of killing our process, please:
     signal(SIGPIPE, SIG_IGN);
 
-    for (int chunkIndex = 0; ; chunkIndex++) {
+    for (int chunkIndex = 0; lastChunkWanted == -1 || chunkIndex <= lastChunkWanted; chunkIndex++) {
         int64_t bytesRead;
 
         if (shouldWriteChunk(chunkIndex)) {
@@ -203,19 +213,19 @@ static int64_t chunk_stream(int stream, int64_t chunkSize, int64_t expectedSize,
             if (output == -1) {
                 throw std::runtime_error("Failed to open FIFO " + std::string(strerror(errno)));
             }
-            
+
             bool writeSuccess = copy_stream(stream, chunkSize, bytesRead, output);
-            
+
             close(output);
-            
+
             if (!writeSuccess) {
                 std::cerr << "Chunk " << chunkIndex << " was closed early by consumer. Skipping remainder of incomplete chunk..." << std::endl;
-                
+
                 overallFailure = true;
-                
+
                 int64_t skippedBytes;
                 copy_stream(stream, chunkSize - bytesRead, skippedBytes);
-                
+
                 bytesRead += skippedBytes;
             }
         } else {
@@ -227,14 +237,14 @@ static int64_t chunk_stream(int stream, int64_t chunkSize, int64_t expectedSize,
 
         if (bytesRead < chunkSize) {
             // We reached EOF in the input stream, so this was the last chunk in the input
-            
+
             // But if there are preallocated FIFOs yet to be processed, keep going so that we can close those
             if (chunkIndex >= expectedChunks - 1) {
                 break;
             }
         }
     }
-    
+
     return totalCopied;
 }
 
