@@ -8,9 +8,74 @@ in order, and chunks must be consumed in order for `fifo-split` to advance to th
 
 `fifo-split` only supports POSIX operating systems (it might run under WSL2, I haven't tried it myself).
 
-Run `./fifo-split --help` to see an explanation of the available settings.
+As new FIFO chunk files are created, `fifo-split` prints the new chunk's filename to stdout, which allows you to use 
+xargs to consume chunks like so:
 
-## Worked example: Chunking a ZFS send stream
+```bash
+cat /dev/urandom \
+  | fifo-split -0 --chunk-size 10MB --prefix "my-backup-" \
+  | xargs -0 -I{} sh -c 'cp "$1" "/mnt/backups/$1"' -- {}
+```
+
+Creates a series of FIFOs (`my-backup-0`, `my-backup-1`, ...) in the current directory, which are then copied as regular 
+files to `/mnt/backups/`.
+
+Or else you can skip using `xargs` and instead manually consume the FIFO files yourself in-order in a different shell, 
+e.g.
+
+```bash
+$ cat /dev/urandom | fifo-split --chunk-size 10MB --expected-size 100MB
+
+Preallocated FIFO for chunk 0 at "chunk0"
+Preallocated FIFO for chunk 1 at "chunk1"
+...
+chunk0
+chunk1
+...
+```
+
+In a separate shell you can consume those chunks in-order:
+
+```bash
+cp chunk0 /mnt/backups/my-backup-0
+cp chunk1 /mnt/backups/my-backup-1
+...
+```
+
+If you don't supply an `--expected-size` then it will only create one chunk FIFO at a time (i.e.
+only `chunk0` will appear on the filesystem, until that chunk has been completely read, then `chunk1` will
+appear next). For manual use this is a little inconvenient since it doesn't allow you to queue up the processing of
+all of your chunks in advance.
+
+If your `--expected-size` estimate is incorrect this is fine, `fifo-split` will automatically create additional FIFO
+chunks as needed in order to take care of any overage (but this only happens once the stream advances to that point,
+they will not be available immediately).
+
+Note that so far these examples are no more powerful than using the [split](https://linux.die.net/man/1/split) command, 
+because we've assumed that all the chunks will simultaneously fit into a single local destination directory and don't 
+require any further processing, but see the next example for a more advanced pipeline. 
+
+Run `fifo-split --help` to see an explanation of the available settings, reproduced here:
+
+```
+Splits a stream up into multiple FIFO chunk files, reads your stream from stdin.
+
+Options:
+  --help                shows this page
+  --chunk-size arg      size of chunks to divide input stream into (e.g. 5GB,
+                        8MiB, 700000B, required)
+  --expected-size arg   expected total size of stream, so that chunk FIFOs can
+                        be preallocated (e.g. 4.5TiB, optional)
+  --prefix arg (=chunk) prefix of filename for chunk FIFOs to generate
+  --only-chunks arg     only output chunks with specified indexes, comma
+                        separated list of ranges (e.g. 0,5,10-)
+  --skip-chunks arg     skip chunks with specified indexes, comma separated
+                        list (e.g. -5,7,13-)
+  -0 [ --print0 ]       use nul characters instead of newlines to separate
+                        chunk filenames in output (for use with 'xargs -0')
+```
+
+## Worked example: Chunking a ZFS send stream to Amazon S3
 
 **Note that this is an advanced method,** you had better understand what you're doing or else 
 you could lose your data. Responsibility is all yours, and a backup isn't successful until 
@@ -19,6 +84,7 @@ you've also validated the restore process.
 If you want to send a very large ZFS send stream to a simple object storage system (such as Amazon S3),
 you might run into troubles with your Internet connection dropping causing the whole upload to 
 be aborted, or you might run into maximum object size limitations (5TB in the case of S3).
+In my case I want to upload to Backblaze B2, which offers an S3-compatible API.
 
 Chunking up the stream solves both of those issues, but if you don't have enough space to locally store a copy of your 
 ZFS send stream, it's difficult to chunk it into pieces to make it more tractable for upload.
@@ -29,98 +95,62 @@ space, making one chunk at a time available for upload to S3.
 First I snapshotted my pool:
 
 ```bash
-zfs snapshot -r tank@my-backup
-```
-
-I decided on a chunk size of 200GB (200,000,000,000 bytes), and checked the expected size of 
-my pool using `zfs list` (4.5TB). Then I ran this command to begin chunking the stream:
-
-```bash
-zfs send --raw -R tank@my-backup | ./fifo-split --chunk-size 200GB --expected-size 4.5TB
-```
-
-`fifo-split` creates a series of FIFO files on disk (`chunk0`, `chunk1`, ...) according to the number of 
-chunks expected given the `expected-size` you gave it. These chunks will become available in order, i.e.
-reading from `chunk1` will stall until `chunk0` has been completely read.
-
-If you don't supply an `expected-size` then it only creates one chunk FIFO at a time (i.e. 
-only `chunk0` will appear on the filesystem, until that chunk has been completely read, then `chunk1` will
-appear next). This is a little inconvenient since it doesn't allow you to queue up the upload of
-all of your chunks in advance.
-
-If your `expected-size` estimate is incorrect this is fine, `fifo-split` will automatically create additional FIFO
-chunks as needed in order to take care of any overage (but this only happens once the stream advances to that point,
-they will not be available immediately).
-
-Now I can begin uploading these chunks to S3 (actually, in my case to Backblaze B2's S3-compatible API).
-
-I used a little shell script to generate the upload commands for me so that I could run them myself manually at
-my leisure. You can adapt this script for your own uses.
-
-I used `pv` to get a progress bar for each upload, and I wanted to compress and encrypt each chunk,
-so I piped them through `zstd` and `gpg`, before finally passing them to the [AWS CLI's](https://aws.amazon.com/cli/) 
-`aws s3 cp` command. You can omit the `zstd` and `gpg` parts if you don't need compression or 
-encryption, and you can replace `pv` with `cat` if you don't need a progress bar:
-
-```bash
 SOURCE=tank@my-backup
-NUM_CHUNKS=23
-CHUNK_SIZE=200000000000
-
-for ((i=0; i < NUM_CHUNKS; i++))
-do
-  echo pv "chunk${i}" \| zstd \| gpg -z 0 --encrypt --recipient n.sherlock@gmail.com \| aws s3 cp --expected-size ${CHUNK_SIZE} --endpoint-url=https://s3.us-east.backblazeb2.com - "s3://my-backups/${SOURCE}.zfs.${i}.zstd.gpg" \&\& echo chunk${i} upload success \|\| echo chunk${i} upload failed
-done
+zfs snapshot -r "${SOURCE}"
 ```
 
-This printed out a series of upload commands for me:
+I decided on a chunk size of 200GB (200,000,000,000 bytes). I used `pv` to get a progress bar for each upload, and I 
+wanted to compress and encrypt each chunk, so I piped them through `zstd` and `gpg`, before finally passing them to 
+the [AWS CLI's](https://aws.amazon.com/cli/) `aws s3 cp` command. You can omit the `zstd` and `gpg` parts if you don't
+need compression or encryption, and you can replace `pv` with `cat` if you don't need a progress bar:
 
 ```bash
-pv chunk0 | zstd | gpg -z 0 --encrypt --recipient n.sherlock@gmail.com | aws s3 cp --expected-size 200000000000 --endpoint-url=https://s3.us-east.backblazeb2.com - s3://my-backups/tank@my-backup.zfs.0.zstd.gpg && echo chunk0 upload success || echo chunk0 upload failed
-pv chunk1 | zstd | gpg -z 0 --encrypt --recipient n.sherlock@gmail.com | aws s3 cp --expected-size 200000000000 --endpoint-url=https://s3.us-east.backblazeb2.com - s3://my-backups/tank@my-backup.zfs.1.zstd.gpg && echo chunk1 upload success || echo chunk1 upload failed
-pv chunk2 | zstd | gpg -z 0 --encrypt --recipient n.sherlock@gmail.com | aws s3 cp --expected-size 200000000000 --endpoint-url=https://s3.us-east.backblazeb2.com - s3://my-backups/tank@my-backup.zfs.2.zstd.gpg && echo chunk2 upload success || echo chunk2 upload failed
+zfs send -R "${SOURCE}" \
+  | fifo-split -0 --chunk-size 200GB --prefix "${SOURCE}." \
+  | xargs -0 -I{} sh -c 'pv "$1" | zstd | gpg -z 0 --encrypt --recipient n.sherlock@gmail.com | aws s3 cp --expected-size 200000000000 --endpoint-url=https://s3.us-east.backblazeb2.com - "s3://my_backups/$1.zfs.zstd.gpg"' -- {}
 ```
 
-So now I can run these one-by-one, in order, to upload my chunks.
+**If the upload of a chunk fails**, `fifo-split` will fast-forward past the end of the aborted chunk for you 
+automatically, and you can come back to re-upload that chunk later. 
 
-**If the upload of a chunk fails**, let's say `chunk5`, you need to finish consuming that chunk before `fifo-split` can 
-advance to the next chunk, like so:
-
-```bash
-pv chunk5 > /dev/null
-```
-
-Continue with the rest of your chunk uploads, and we'll retry any failed chunks afterwards.
-
-**To retry chunks** we regenerate the ZFS send stream and ask `fifo-split` to only give us the chunks we're interested in
-using the `--only-chunks` option.
-
-This is only possible because `zfs send` produces the same bitstream each time it is sent (at least within a ZFS version), 
-so we're able to re-run the `zfs send` command to reproduce the stream we failed to upload.
+**To retry chunks** we re-run the upload command to regenerate the ZFS send stream, but this time we ask
+`fifo-split` to only give us the chunks we're interested in using the `--only-chunks` option.
 
 For example:
 
 ```bash
-zfs send --raw -R tank@my-backup | ./fifo-split --chunk-size 200GB --expected-size 4.5TB --only-chunks 5,13,23
+zfs send -R "${SOURCE}" \
+  | fifo-split --only-chunks 5,13,23 -0 --chunk-size 200GB --prefix "${SOURCE}." \
+  | xargs -0 -I{} sh -c 'pv "$1" | zstd | gpg -z 0 --encrypt --recipient n.sherlock@gmail.com | aws s3 cp --expected-size 200000000000 --endpoint-url=https://s3.us-east.backblazeb2.com - "s3://my_backups/$1.zfs.zstd.gpg"' -- {}
 ```
 
-`fifo-split` will fast-forward through the stream until it reaches the chunks of interest, and only write to the FIFOs 
-with those indices. Note that "fast-forwarding" is a bit of a misnomer, since skipping chunks takes the same amount of time
-as `zfs send > /dev/null` (but this'll still be much faster than re-uploading every chunk to S3!).
+`fifo-split` will fast-forward through the stream until it reaches the chunks of interest, and only write to and upload 
+the FIFOs with those indices. Note that "fast-forwarding" is a bit of a misnomer, since skipping chunks takes the same 
+amount of time as `zfs send > /dev/null` (but this'll still be much faster than re-uploading every chunk to S3!).
 
 ```bash
-Preallocated FIFO for chunk 5 at "chunk5"
-Preallocated FIFO for chunk 13 at "chunk13"
-Preallocated FIFO for chunk 23 at "chunk23"
+Preallocated FIFO for chunk 5 at "tank@my-backup.5"
+Preallocated FIFO for chunk 13 at "tank@my-backup.13"
+Preallocated FIFO for chunk 23 at "tank@my-backup.23"
 Skipping chunk 0...
 Skipping chunk 1...
 Skipping chunk 2...
 Skipping chunk 3...
 Skipping chunk 4...
-Copying chunk 5 to "chunk5"...
 ```
 
-Now we can re-upload those chunk FIFOs (chunk5, chunk13, chunk23) using the same upload commands we generated before.
+**This is only possible** because `zfs send` produces the same bitstream each time it is sent (at least within a ZFS version),
+so we are able to re-run the `zfs send` command to reproduce the stream we failed to upload.
+
+**But note that this is not the case for ZFS before version 2.1.8 with the embedded blocks option enabled** (i.e. send using 
+`--raw` or `-e`), due to a bug in `zfs send` which fails to properly initialise the padding memory at the end of an 
+embedded block, causing those bytes to take on random values:
+
+https://github.com/openzfs/zfs/issues/13778
+
+These raw streams do not have a consistent checksum, and therefore resuming the upload will create a backup with
+inconsistent internal checksums that ZFS will refuse to receive. You'd have to patch `zfs recv` to ignore bad stream
+checksums to receive such a backup. Upgrade to 2.1.8 or later before sending.
 
 ### Restoring from this chunked zfs send-stream
 
@@ -129,6 +159,8 @@ then join those together in order with `pv` or `cat`, and start receiving them t
 destination:
 
 ```bash
+NUM_CHUNKS=23
+
 for ((i=0; i < NUM_CHUNKS; i++))
 do
   rm -f "chunk${i}"
@@ -142,13 +174,13 @@ pv $(eval "echo chunk{0..$((NUM_CHUNKS - 1))}") | zfs recv tank/destination
 Now `zfs recv` hangs waiting for the first FIFO to begin being filled up.
 
 In a separate shell, we can start downloading chunks from S3 and piping them into the chunk 
-FIFOs (be sure to load those variables like NUM_CHUNKS into this new shell first). We unwrap 
+FIFOs (be sure to load those variables like `SOURCE` and `NUM_CHUNKS` into this new shell first). We unwrap 
 the encryption and compression we applied before we give the result to zfs:
 
 ```bash
 for ((i=0; i &lt; NUM_CHUNKS; i++))
 do
-  aws s3 cp --endpoint-url=https://s3.us-east.backblazeb2.com "s3://my-backups/${SOURCE}.zfs.${i}.zstd.gpg" - | gpg2 --decrypt | zstd -d > "chunk${i}"
+  aws s3 cp --endpoint-url=https://s3.us-east.backblazeb2.com "s3://my_backups/${SOURCE}.${i}.zfs.zstd.gpg" - | gpg2 --decrypt | zstd -d > "chunk${i}"
 done
 ```
 
@@ -169,7 +201,7 @@ to its destination on the target pool.
 for ((i=0; i < NUM_CHUNKS; i++))
 do
   rm -f "chunk${i}"
-  aws s3 cp --endpoint-url=https://s3.us-east.backblazeb2.com "s3://my-backups/${SOURCE}.zfs.${i}.zstd.gpg" - | gpg2 --decrypt | zstd -d > "chunk${i}"
+  aws s3 cp --endpoint-url=https://s3.us-east.backblazeb2.com "s3://my_backups/${SOURCE}.${i}.zfs.zstd.gpg" - | gpg2 --decrypt | zstd -d > "chunk${i}"
 done
 
 pv $(eval "echo chunk{0..$((NUM_CHUNKS - 1))}") | zfs recv tank/destination

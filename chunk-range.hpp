@@ -69,6 +69,10 @@ namespace client {
     }
 }
 
+/**
+ * Represents a list of ranges, which can have finite or infinite boundaries, e.g. 2-2,5-9,11- is a valid set of ranges, 
+ * and includes (for instance) 2, and all numbers from 11 onwards, but not 1 or 10.
+ */
 class RangeList {
 private:
     std::vector<chunk_range> ranges;
@@ -113,7 +117,7 @@ public:
      * @param result 
      * @return true if there was a finite boundary, otherwise false and the value of "result" is not well-defined 
      */
-    bool getSmallestBound(int &result) const {
+    bool getSmallestFiniteBound(int &result) const {
         int resultValid = false;
         
         for (chunk_range range: ranges) {
@@ -136,7 +140,7 @@ public:
      * @param result 
      * @return true if there was a finite boundary, otherwise false and the value of "result" is not well-defined 
      */
-    bool getLargestBound(int &result) const {
+    bool getLargestFiniteBound(int &result) const {
         int resultValid = false;
 
         for (chunk_range range: ranges) {

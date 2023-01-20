@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <csignal>
 
 #include <boost/program_options.hpp>
 #include <boost/spirit/home/x3.hpp>
@@ -158,7 +159,7 @@ static void create_fifo(const std::string &fifoFilename) {
     }
 }
 
-static int64_t chunk_stream(int stream, int64_t chunkSize, int64_t expectedSize, const std::string &chunkPrefix, const RangeList &onlyChunks, const RangeList &skipChunks) {
+static int64_t chunk_stream(int stream, int64_t chunkSize, int64_t expectedSize, const std::string &chunkPrefix, const RangeList &onlyChunks, const RangeList &skipChunks, bool zeroSep) {
     auto shouldWriteChunk = [&](int chunkIndex) {
         return (onlyChunks.empty() || onlyChunks.contains(chunkIndex)) && !skipChunks.contains(chunkIndex);
     };
@@ -169,7 +170,7 @@ static int64_t chunk_stream(int stream, int64_t chunkSize, int64_t expectedSize,
     int lastChunkWanted;
 
     // Do we already know the index of the final chunk we will produce due to finite onlyChunks filters?
-    if (!onlyChunks.empty() && !onlyChunks.containsPositiveInf() && onlyChunks.getLargestBound(lastChunkWanted)) {
+    if (!onlyChunks.empty() && !onlyChunks.containsPositiveInf() && onlyChunks.getLargestFiniteBound(lastChunkWanted)) {
         // This overrides the calculation based on expectedSize
         expectedChunks = lastChunkWanted + 1;
     } else {
@@ -178,7 +179,7 @@ static int64_t chunk_stream(int stream, int64_t chunkSize, int64_t expectedSize,
 
     // If the user explicitly referenced chunk indexes in onlyChunks, also preallocate FIFOs reaching that number
     int maxBound;
-    if (onlyChunks.getLargestBound(maxBound)) {
+    if (onlyChunks.getLargestFiniteBound(maxBound)) {
         expectedChunks = std::max(expectedChunks, maxBound + 1);
     }
 
@@ -202,24 +203,25 @@ static int64_t chunk_stream(int stream, int64_t chunkSize, int64_t expectedSize,
 
         if (shouldWriteChunk(chunkIndex)) {
             std::string fifoFilename = chunkPrefix + std::to_string(chunkIndex);
-            std::cerr << "Copying chunk " << chunkIndex << " to \"" << fifoFilename << "\"..." << std::endl;
-
+            
             if (chunkIndex >= expectedChunks) {
                 // Since we didn't preallocate one
                 create_fifo(fifoFilename);
             }
 
+            std::cout << fifoFilename << (zeroSep ? std::string("\0", 1) : "\n") << std::flush;
+
             int output = open(fifoFilename.c_str(), O_WRONLY);
             if (output == -1) {
                 throw std::runtime_error("Failed to open FIFO " + std::string(strerror(errno)));
             }
-
+            
             bool writeSuccess = copy_stream(stream, chunkSize, bytesRead, output);
 
             close(output);
 
             if (!writeSuccess) {
-                std::cerr << "Chunk " << chunkIndex << " was closed early by consumer. Skipping remainder of incomplete chunk..." << std::endl;
+                std::cerr << "Chunk " << chunkIndex << " was closed early by consumer. Skipping remainder of chunk..." << std::endl;
 
                 overallFailure = true;
 
@@ -260,6 +262,7 @@ int main(int argc, char **argv) {
             "prefix of filename for chunk FIFOs to generate")
         ("only-chunks", po::value<std::string>(), "only output chunks with specified indexes, comma separated list of ranges (e.g. 0,5,10-)")
         ("skip-chunks", po::value<std::string>(), "skip chunks with specified indexes, comma separated list (e.g. -5,7,13-)")
+        ("print0,0", "use nul characters instead of newlines to separate chunk filenames in output (for use with 'xargs -0')")
         ;
 
     po::variables_map vm;
@@ -337,7 +340,7 @@ int main(int argc, char **argv) {
         skipChunks.parse(list.begin(), list.end());
     }
     
-    int64_t totalBytes = chunk_stream(fileno(stdin), chunkSize, expectedSize, vm["prefix"].as<std::string>(), onlyChunks, skipChunks);
+    int64_t totalBytes = chunk_stream(fileno(stdin), chunkSize, expectedSize, vm["prefix"].as<std::string>(), onlyChunks, skipChunks, vm.count("print0") > 0);
     
     std::cerr << "Total stream size was " << std::to_string(totalBytes) << " bytes" << std::endl;
     
