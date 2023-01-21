@@ -1,5 +1,8 @@
 # fifo-split
 
+**n.b. this package does not have any tests yet**, I wouldn't suggest that anybody use it in anger until I've added some 
+tests.
+
 This tool allows you to split up a stream into multiple FIFO chunk streams, according to a specified
 chunk size, without using any additional storage space. 
 
