@@ -181,7 +181,7 @@ FIFOs (be sure to load those variables like `SOURCE` and `NUM_CHUNKS` into this 
 the encryption and compression we applied before we give the result to zfs:
 
 ```bash
-for ((i=0; i &lt; NUM_CHUNKS; i++))
+for ((i=0; i < NUM_CHUNKS; i++))
 do
   aws s3 cp --endpoint-url=https://s3.us-east.backblazeb2.com "s3://my_backups/${SOURCE}.${i}.zfs.zstd.gpg" - | gpg2 --decrypt | zstd -d > "chunk${i}"
 done
